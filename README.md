@@ -3,7 +3,7 @@ These are wrapper scripts in python and bash to transcribe audio to text via whi
 
 The problem:
 - I recorded some confcalls (via a phone in speaker mode and another phone recording the call) that I wanted to transcribe to text to have minutes of the call.
-- I have an old linux spare PC with an old NVDIA graphic card, not powerful enough for modern 3D games, but with decent memory (6G) and able to run GPU "cuda" code: a Nvidia RTX 1060 with 5G RAM (what is called the "Pascal" architecture. This code will work with any more recent NVidia card with at **least 6G VRAM.**
+- I have an old linux spare PC with an old NVDIA graphic card, not powerful enough for modern 3D games, but with decent memory (6G) and able to run GPU "cuda" code: a Nvidia RTX 1060 with 6G RAM (what is called the "Pascal" architecture. This code will work with any more recent NVidia card with at **least 6G VRAM.**
 
 This solution:
 - use the whisper, ffmpeg, pyannote libraries via their python APIs/wrappers
