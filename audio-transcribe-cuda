@@ -1,0 +1,245 @@
+#!/bin/bash
+# Options for shellcheck:
+# Allows combining variable declaration and assignment, e.g: local a=b
+# Allows A && B || C, as we take care ourselves that B is always true if A true
+# Do not try to check loaded files, as they are config files
+# shellcheck disable=SC2155,SC2015,SC1090
+
+############ User manual:
+VERSION="0.1.0"
+ATC='audio-transcribe-cuda'
+USAGE="$ATC [options] audiofiles..."'
+Transcribe audio on a NVIDIA GPU (cuda libs)
+It will produce the transcription as files:
+  audiofile.tsv (subtitle format with all the info for further conversions)
+  audiofile.txt (human-readable text with timings)
+It uses the python3 scripts faster-whisper.py and pyannote.py 
+Options:
+  -o name   sets outputfile to name. Only works with only one audiofile given
+  -e        equalize voices first. Use in confcalls where local voices are
+            louder than remote ones.
+  -d        determine speakers, aka speaker diarisation
+            Warning: this is twice as slow as the transcription itself
+  -f        use full float16 computations in whisper (faster). Not supported on
+            older Nvidia cards (RTX 1xxx, "Pascal") where we use int8.
+            Default is int8_float16
+  -t        translates to English, otherwise stay in the spoken language.
+  -T lang   translates to language "lang" (2-letter code: en, fr, de, ...).
+            Warning: languages other than English do not work well, if at all.
+  -m model  uses model. Defaults to large-v3
+  -q N      "quality", actually sets whisper --beam_size option, default 5
+  -D        Debug mode: do not remove the temporary files
+  -V        print the version of this script and exit
+
+Full docs at https://github.com/ColasNahaboo/audio-transcribe-cuda
+'
+
+############ Options and Configuration default values
+doequal=false                   # -e
+dospeakers=false                # -d
+quality=5                       # -q
+model=large-v3                  # -m
+lang=                           # -T, -t being "-T en"
+tmpdir=/tmp/$ATC                # where the temporary files will be created
+bindir=/opt/$ATC                # the directory where the scripts reside
+debug=false                     # -D
+computation=int8_float16        # possible values are: default, auto, int8, int8_float32, int8_float16, int8_bfloat16, int16, float16, bfloat16, float32
+HUGGINGFACE_ACCESS_TOKEN=       # to be defined in config, needed only for '-d'
+
+###### Config files parsing
+[[ -e /etc/default/$ATC ]] && . /etc/default/$ATC
+[[ -e ~/.config/$ATC ]] && ~/.config/$ATC
+
+###### Options parsing
+OPTIONS='edfm:q:DtT:o:V'
+
+#----https://github.com/ColasNahaboo/bashoptions--------------getopts----v0.2.2
+V(){ :;};T(){ :;};v=false;E(){ echo "$@";};En(){ E -n "$@";};VV(){ :;}
+err(){ E "***ERROR: $*" >&2; exit 1;};warn(){ E "###Warning: $*" >&2;}
+nl=$'\n'; OPTIND=1;while getopts ":${OPTIONS}hv?" _o;do case "$_o" in
+#----single letter options start-----------------------------------------
+e) doequal=true;;
+d) dospeakers=true
+   [[ -z "$HUGGINGFACE_ACCESS_TOKEN" ]] && err "No Hugging Face Access Token defined!"
+   ;;
+t) lang=en;;
+T) lang="$OPTARG";;
+f) computation=float16;;
+m) model="$OPTARG";;
+q) quality="$OPTARG";;
+D) debug=true;;
+o) outputfile="$OPTARG";;
+V) echo "$VERSION"; exit 0;;
+#----single letter options end-------------------------------------------
+v)T(){ local i;{ En "==";for i in "$@";do [[ $i =~ [^_[:alnum:]] ]]&&En " $i"||
+En " $i=${!i}";done;E;}>&2;};V(){ E "== $*" >&2;};v=true;;h) E "$USAGE"
+exit;;\?)err "Bad option: -$OPTARG, -h for help.";;':')err "Missing arg: \
+-$OPTARG";;*)err "Bad option: -$_o, -h for help.";esac;done;shift $((OPTIND-1))
+#----bashoptions-getopts end---------------------------------------------
+export v nl                   # avoid shellcheck warning for unused variables
+
+##### Setup
+
+[[ -n "$outputfile" ]] && (($# > 1)) && err "-o only works with only one audiofile in argument, not $#"
+
+# hardware detection
+[[ $(lspci) =~ 'GeForce GTX 1' ]] && computation=int8 # downgrade for GTX 10x0
+[[ $(lspci) =~ 'GeForce GTX ' ]] || err "No Nvidia GTX card detected!"
+
+# setup temporay working dir, cleaned on any exit
+export tmp="$tmpdir/job-$$"
+cleanup(){ "$debug" || rm -rf "$tmp"; }
+setup(){ cleanup; mkdir -p "$tmp"; }
+trap cleanup 0
+
+############ Processing
+
+# equalize voices levels
+equalize_audio() {
+    local in="$1" out="$2"
+    local t_start=$(date +%s)
+    echo "== Equalizing audio..."
+    ffmpeg -loglevel fatal -i "$in" -af "compand=0|0:1|1:-90/-900|-70/-70|-30/-9|0/-3:6:0:0:0" -c:a ac3 -vn "$out" || exit 2
+    echo "== Audio equalize done in $(( $(date +%s) - t_start)) seconds"
+}
+
+# transcribe with faster-whisper into a .tsv file
+transcribe(){
+    local in="$1" out="$2" model="$3" qbs="$4" computation="$5" lang="$6"
+    local t_start=$(date +%s)
+    
+    echo "== Transcribing $in via GPU with faster-whisper on model $model..."
+    # Setting libraries path for faster-whisper.py
+    export LD_LIBRARY_PATH=$(python3 -c 'import os; import nvidia.cublas.lib; import nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))')
+    ./faster-whisper.py "$in" "$out" "$model" "$qbs" "$computation" "$lang" || exit 3
+    echo "== Transcription done in $(( $(date +%s) - t_start)) seconds"
+}
+
+# speaker diarisation
+diarisate(){
+    local in="$1" out="$2"
+    local t_start=$(date +%s)
+    echo "== Speaker Diarisation via GPU with pyanote..."
+    ./pyannote.py "$in" "$out" "$HUGGINGFACE_ACCESS_TOKEN" || exit 4
+    echo "== Speaker Diarisation done in $(( $(date +%s) - t_start)) seconds"
+}
+
+# merge speakerinfo into the transcription
+mergespeakers(){
+    local in="$1" si="$2" out="$3"
+    local in_head i=0 lastw=-1 cur=0 s e w text swn
+    local -a who                # strings: "start speakerid"
+    echo "== Merging speaker info into transcription..."
+    # create database of speakers starting positions
+    {
+        read -r in_head
+        [[ $in_head == 'start end speaker' ]] || \
+            err "mergespeakers: bad speakers diarization file $si"
+        while read -r s e w; do
+            ((w == lastw)) && continue # aggregate if same speaker
+            who[i]="$s $w"
+            ((lastw = w))
+            ((i++))
+        done
+        who[i]="999999999999999999 0" # end marker
+    } <"$si"
+    # now, inject a new field "speaker id"
+    {
+        read -r in_head
+        [[ $in_head == 'start end text' ]] || \
+            err "mergespeakers: bad transcription file $in"
+        echo "start end speaker text"
+        while read -r s e text; do
+            # look for next segment of speaker in which we are
+            swn="${who[cur+1]% *}"
+            while (( s >= swn )); do
+                  ((cur++))
+                  swn="${who[cur+1]% *}"
+            done
+            w="${who[cur]#* }"
+            echo "$s $e $w $text"
+        done            
+    } <"$in" >"$out"
+}
+
+# extract audio "as is" from videos without re-encoding
+# if succeeds, return 0 and prints the file to use as audio
+
+extract_audio(){
+    local video="$1" name="$2" ext="${1##*.}"
+    if ! [[ $ext =~ (avi|m4v|mkv|mp4|ts|wmv|mov|avchd|webm|flv|mts|qt|mpv|mpg|mpeg|svi|3g2) ]]; then
+        if [[ $ext =~ ^(aac|ac3|mpeg|opus|pcm|wma|eac3|flac|mp3)$ ]]; then
+            # this is actually an audio track, use it directly
+            echo "$video"
+            return 0
+        else                    # else we failed
+            return 1
+        fi
+    fi
+    # this is a known video format, extract its audio track "as is"
+    # we get the audio codec used on the audio track via some mediainfo magic
+    local aext=$(mediainfo "$video" | sed -e '1,/^Audio/d' |grep -oPm1 '^Format[[:space:]]*:[[:space:]]*\K[^[:space:]]+' | tr -d -)
+    [[ -n "$aext" ]] || return 1
+    local audio="$name.${aext,,}"
+    ffmpeg -loglevel -i "$video" -map 0:a:0 -c:a copy "$audio"
+    echo "$audio"
+    return 0
+}
+
+############ Main loop
+
+for i in "$@"; do
+    setup
+    echo "Processing $i..."
+    t_start=$(date +%s)
+    file=$(realpath "$i")
+    name="${file%.*}"
+    OLDWD="$PWD"
+    cd "$bindir" || exit 1
+    cleanup; mkdir -p "$tmp"
+    
+    # the temporary files used to pass data between each step
+    Fraw="$tmp/fraw.m4a"        # input file
+    Faudioname="$tmp/fraw"      # base input for audio file, raw-extracted
+    Faudio="$tmp/faudio.m4a"    # pre-processed audio
+    Ftrans="$tmp/ftrans.tsv"    # voice->text transcription
+    Ftsv="$tmp/ftsv.tsv"        # post-processed (speaker diarisation)
+    
+    # extract audio if needed => Fraw
+    if Faudioraw=$(extract_audio "$file" "$Faudioname"); then
+        Fraw="$Faudioraw"
+    else                        # else fallback on generic ffmpeg re-encoding
+        t_start=$(date +%s)
+        echo "== Extracting audio from $file..."
+        ffmpeg -loglevel fatal -i "$file" -c:a ac3 -b:a 256k "$Fraw" || exit 1
+        echo "== Extraction done in $(( $(date +%s) - t_start)) seconds"
+    fi
+    # equalize => Faudio
+    if "$doequal"; then
+        equalize_audio "$Fraw" "$Faudio"
+    else
+        Faudio="$Fraw"
+    fi
+    # transcribe => Ftrans
+    transcribe "$Faudio" "$Ftrans" "$model" "$quality" "$computation" "$lang"
+    # diarisation => Ftsv
+    if "$dospeakers"; then      # pyannote works best with .wav
+        Fdia_wav="$tmp/fdia.wav"
+        Fdia_tsv="$tmp/fdia.tsv"
+        ffmpeg -loglevel fatal -i "$Faudio" "$Fdia_wav"
+        diarisate "$Fdia_wav" "$Fdia_tsv"
+        mergespeakers "$Ftrans" "$Fdia_tsv" "$Ftsv"
+    else
+        ln -sf "$Ftrans" "$Ftsv"
+    fi
+
+    # emit the final result: $name.tsv
+    Final="$name.tsv"
+    [[ -n "$lang" ]] && [[ "$lang" != en ]] && Final="$name.$lang.tsv"
+    [[ -n "$outputfile" ]] && Final="$outputfile"
+    [[ -s "$Ftsv" ]] && cp "$Ftsv" "$Final"
+    echo "Processing done in $(( $(date +%s) - t_start)) seconds"
+    echo "Result in $Final"
+    "$debug" && echo "NOTE: Debug mode, temp files left in: $tmp"
+    cd "$OLDWD" || exit 1
+done

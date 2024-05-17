@@ -1,3 +1,19 @@
+# Private notes
+NOTES.md
+# private keys
+HUGGINGFACE_ACCESS_TOKEN.txt
+# temp editor files
+*~
+\#*
+# Go debugger
+__debug_bin
+# dotfiles
+.*
+# video samples
+samples/*
+
+############ Python standard from GitHub
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

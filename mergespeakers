@@ -1,0 +1,44 @@
+#!/bin/bash
+E(){ echo "$@";}
+err(){ E "***ERROR: $*" >&2; exit 1;}
+
+# merge speakerinfo into the transcription
+mergespeakers(){
+    local in="$1" si="$2" out="$3"
+    local in_head i=0 lastw=-1 cur=0 s e w text swn
+    local -a who                # strings: "start speakerid"
+    # create database of speakers starting positions
+    {
+        read -r in_head
+        [[ $in_head == 'start end speaker' ]] || \
+            err "mergespeakers: bad speakers diarization file $si"
+        while read -r s e w; do
+            ((w == lastw)) && continue # aggregate if same speaker
+            who[i]="$s $w"
+            ((lastw = w))
+            ((i++))
+        done
+        who[i]="999999999999999999 0" # end marker
+    } <"$si"
+    # now, inject a new field "speaker id"
+    {
+        read -r in_head
+        [[ $in_head == 'start end text' ]] || \
+            err "mergespeakers: bad transcription file $in"
+        echo "start end speaker text"
+        while read -r s e text; do
+            # look for next segment of speaker in which we are
+            swn="${who[cur+1]% *}"
+            while (( s >= swn )); do
+                  ((cur++))
+                  swn="${who[cur+1]% *}"
+                  echo "== s=$s, moving to who[$cur] = ${who[cur]}, swn=$swn" >&2
+            done
+            w="${who[cur]#* }"
+            echo "$s $e $w $text"
+        done            
+    } <"$in" >"$out"
+}
+
+mergespeakers samples/CPC-1.tsv samples/CPC-1.spdi samples/CPC-1-merged.tsv 
+cat samples/CPC-1-merged.tsv

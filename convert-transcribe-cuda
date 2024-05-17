@@ -1,0 +1,246 @@
+#!/bin/bash
+# converts the .tsv created by audio-transcribe-cuda into various formats
+# Allows A && B || C, as we ensure B is always true if A true
+# shellcheck disable=SC2155,SC2015
+
+# User manual:
+VERSION="0.1.0"
+USAGE='convert-transcribe-cuda [options] transcription.tsv [speakers...]
+Prints on stdout the convesion of a .tsv resulting from audio-transcribe-cuda
+into other formats specified in options.
+If the .tsv has speaker info (-d was used with audio-transcribe-cuda)
+the speakers list remplace the ids 0, 1, 2...
+Options:
+  -i    IRC mode: human-readable, informal (default), with terse timecodes
+  -t    TEXT mode: just the wall of text, no timecodes
+  -s    SRT mode: standard subtitle format, plain text no style
+  -n    no speakers: ignore speakers info if present
+  -V
+Example:
+  convert-transcribe-cuda confcall.tsv Alice Bob Charles >confcall.txt
+
+Full docs at https://github.com/ColasNahaboo/audio-transcribe-cuda
+'
+
+# Subtitle rules:
+# in general max length 35 chars, and max 2 lines
+# min dur 1s, max dur 6s. Average 3 words/second = 085ms / char
+# We will use min of 90ms / char, and 1 line of 80 chars, as video players
+# split long lines themselves
+
+# Options default values:
+format=irc
+dospeakers=true
+srt_maxchars=80
+srt_minchartime=90
+
+# Options list
+OPTIONS='isntV'
+
+#----https://github.com/ColasNahaboo/bashoptions--------------getopts----v0.2.2
+V(){ :;};T(){ :;};v=false;E(){ echo "$@";};En(){ E -n "$@";};VV(){ :;}
+err(){ E "***ERROR: $*" >&2; exit 1;};warn(){ E "###Warning: $*" >&2;}
+nl=$'\n'; OPTIND=1;while getopts ":${OPTIONS}hv?" _o;do case "$_o" in
+#----single letter options start-----------------------------------------
+i) format=irc;;
+s) format=srt;;
+t) format=txt;;
+n) dospeakers=false;;
+V) echo "$VERSION"; exit 0;;
+#----single letter options end-------------------------------------------
+#----single letter options end-------------------------------------------
+v)T(){ local i;{ En "==";for i in "$@";do [[ $i =~ [^_[:alnum:]] ]]&&En " $i"||
+En " $i=${!i}";done;E;}>&2;};V(){ E "== $*" >&2;};v=true;;h) E "$USAGE"
+exit;;\?)err "Bad option: -$OPTARG, -h for help.";;':')err "Missing arg: \
+-$OPTARG";;*)err "Bad option: -$_o, -h for help.";esac;done;shift $((OPTIND-1))
+#----bashoptions-getopts end---------------------------------------------
+export v nl                   # avoid warning for unused variables
+
+# global vars
+has_speakers=false
+
+(( $# < 1 )) && { echo "$USAGE" >&2; exit 1;}
+file="$1"
+[[ -s "$file" ]] || err "File not found: $file"
+
+###### converters: read file on stdin, speaker names as arguments, uses globals
+
+### IRC
+
+to_irc(){
+    local s w text i=0 lastw=-1 -a unknown
+    if $has_speakers; then
+        while read -r s _ w text; do
+            ms=$(minsec "$s")
+            if [[ "$w" != "$lastw" ]]; then
+                wn="${who[w]}"
+                if [[ -n "$wn" ]]; then wn=" $wn: "
+                else
+                    wn=" #$w: "
+                    unknown[w]="$w"
+                fi
+                echo "[$ms]$wn $text"
+                lastw="$w"
+            else                # same speaker, continuation line
+                #    "[MM:SS] W: "
+                echo "           $text"
+            fi
+        done
+        if [[ -n "${unknown[*]}" ]]; then
+            echo "###Warning: No speakers names given for speaker(s) number: ${unknown[*]}" >&2
+        fi
+    else
+        while read -r s _ text; do
+            ms=$(minsec "$s")
+            echo "[$ms] $text"
+        done
+    fi
+}
+
+### TXT
+
+to_txt(){
+    local text
+    if $has_speakers; then
+        while read -r _ _ _ text; do
+            echo "$text"
+        done
+    else
+        while read -r _ _ text; do
+            echo "$text"
+        done
+    fi
+}
+
+### SRT
+
+to_srt(){
+    local s e w text i=0 lastw=-1
+    local -a unknown limits
+    # limits: for each entry, maximum time it has: up until the next entry starts
+    while read -r s _; do
+        limits[i]="$s"
+        ((i++))
+    done < <(tail -n +3 "$file")
+    i=0
+    if $has_speakers; then
+        if "$dospeakers"; then
+            while read -r s e w text; do
+                if [[ "$w" != "$lastw" ]]; then
+                    wn="${who[w]}"
+                lastw="$w"
+                else
+                    wn=''
+                fi
+            if [[ -n "$wn" ]]; then wn=" $wn: "
+            else wn=" #$w: "; unknown[w]="$w"
+            fi
+            srt_subtitle "$s" "$e" "$wn$text" "${limits[i]}"
+            ((i++))
+            done
+            if [[ -n "${unknown[*]}" ]]; then
+                echo "###Warning: No speakers names given for speaker(s) number: ${unknown[*]}" >&2
+            fi
+        else
+            while read -r s e _ text; do
+                srt_subtitle "$s" "$e" "$text" "${limits[i]}"
+                ((i++))
+            done
+        fi
+    else
+        while read -r s e text; do
+            srt_subtitle "$s" "$e" "$text" "${limits[i]}"
+            ((i++))
+        done
+    fi
+}
+
+# enforce subtitle rules, split it if needed
+srt_subtitle(){
+    local s="$1" e="$2" t="$3" limit="$4" mindur rest t1 dur
+    V "srt_subtitle $*"
+    # increase duration if it seems too short
+    ((mindur = ${#t} * srt_minchartime))
+    (((e - s) < mindur)) && ((e = s + mindur))
+    # but stay under limit
+    if [[ -n "$limit" ]]; then
+        ((e >= limit)) && ((e = limit - 1))
+    fi
+    # split if too long
+    while ((${#t} > srt_maxchars)); do
+        t1="${t:0:srt_maxchars}"
+        if [[ $t1 =~ ^(.*[.,?!:;])' ' ]]; then # we can cut at a sentence end
+            cut=${#BASH_REMATCH[1]}
+            rest="${t:((cut+1))}"
+            t="${t:0:$cut}"
+        else
+            cut=srt_maxchars
+            while [[ ${t:cut:1} != ' ' ]] && ((cut >= 3)); do
+                ((cut--))
+                done
+            if ((cut < 3)); then #  force cut, add a trailing "-"
+                ((cut--))
+                rest="${t:((cut))}"
+                t="${t:0:$cut}-"
+            else                 # cut at space, remove it
+                rest="${t:((cut+1))}"
+                t="${t:0:$cut}"
+            fi
+        fi
+        ((dur = ((e - s) * ${#t}) / (${#t} + ${#rest})))
+        srt_subtitle_print "$s" $((s + dur - 1)) "$t"
+        ((s += dur))
+        t="$rest"
+    done
+    srt_subtitle_print "$s" "$e" "$t"
+}
+
+# actual print
+srt_subtitle_print(){
+    [[ -z "$3" ]] && return
+    local s="$1" e="$2" t="$3"
+    (( e <= s )) && err "e<s: s=$s, e=$e, t=$t"
+    local ss se
+    ((srt_subtitle_ln++))
+    echo "$srt_subtitle_ln"
+    ss=$(srttime "$s")
+    se=$(srttime "$e")
+    echo "$ss --> $se"
+    echo "$t"
+    echo
+}
+
+###### utils
+
+# ms => human readble MM:SS
+minsec(){
+    printf '%02d:%02d' $((($1/1000) / 60)) $((($1 / 1000) % 60))
+}
+
+# ms => time in SRT format: HH:MM:SS,MSS
+srttime(){
+    printf '%02d:%02d:%02d,%03d' $(("$1" / 3600000)) $(( ("$1" / 60000) % 60)) $(( ("$1" / 1000) % 60)) $(("$1" % 1000))
+}
+
+############ Main loop
+
+file="$1"; shift
+{
+    read -r header
+    if [[ $header == "start end speaker text" ]]; then
+        has_speakers=true
+        who=("$@")
+    elif [[ $header == "start end text" ]]; then
+        has_speakers=false
+    else
+        err "Not a proper TSV file (missing header?): $file"
+    fi
+    case "$format" in
+        irc) to_irc "$@";;
+        srt) to_srt "$@";;
+        txt) to_txt "$@";;
+        *) err "Unknown format: $format"
+    esac
+} <"$file"
+
+     
